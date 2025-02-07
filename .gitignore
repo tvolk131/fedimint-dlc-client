@@ -1,0 +1,7 @@
+/target
+/result
+.idea
+.tmpenv
+.direnv
+.vscode
+target-nix/

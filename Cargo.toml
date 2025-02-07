@@ -1,0 +1,97 @@
+[workspace]
+members = [
+    "fedimintd",
+    "fedimint-cli",
+    "fedimint-lnv2-remote-client",
+    "fedimint-lnv2-remote-tests",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+
+[workspace.metadata]
+name = "fedimint-lnv2-remote"
+authors = ["The Fedimint Developers"]
+edition = "2021"
+description = "Fedimint compiled with custom module set"
+documentation = "https://github.com/fedimint/fedimint-custom-modules-example"
+readme = "README.md"
+homepage = "https://github.com/fedimint/fedimint-custom-modules-example"
+repository = "https://github.com/fedimint/fedimint-custom-modules-example"
+license-file = "LICENSE"
+keywords = ["bitcoin", "lightning", "chaumian", "e-cash", "federated"]
+
+[workspace.dependencies]
+fedimintd = "0.5.0"
+fedimint-api-client = "0.5.0"
+fedimint-cli = "0.5.0"
+fedimint-core = "0.5.0"
+fedimint-server = "0.5.0"
+fedimint-client = "0.5.0"
+fedimint-lnv2-common = "0.5.0"
+fedimint-logging = "0.5.0"
+fedimint-testing = "0.5.0"
+fedimint-tpe = "0.5.0"
+devimint = "0.5.0"
+aead = "0.5.0"
+
+async-stream = "0.3.6"
+async-trait = "0.1.85"
+bitcoin = { version = "0.32.5", features = ["serde"] }
+bincode2 = "2.0.1"
+anyhow = "1.0.66"
+clap = { version = "4.5.26", features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "env",
+], default-features = false }
+futures = "0.3.28"
+itertools = "0.14.0"
+erased-serde = "0.4.5"
+lightning-invoice = "0.32.0"
+nostr-sdk = "0.38.0"
+schnorr_fun = { version = "0.10.0", features = ["serde", "bincode"] }
+tracing = "0.1.41"
+rand = "0.8.5"
+secp256k1 = "0.29.0"
+serde = { version = "1.0.149", features = ["derive"] }
+serde_json = { version = "1.0.91", features = ["preserve_order"] }
+sha2 = "0.10"
+strum = "0.26.3"
+strum_macros = "0.26.4"
+thiserror = "2.0.11"
+tikv-jemallocator = "0.6.0"
+tokio = { version = "1.43.0", features = ["full", "tracing"] }
+url = "2.5.4"
+
+[profile.dev]
+split-debuginfo = "packed"
+
+# in dev mode optimize crates that are perf-critical (usually just crypto crates)
+[profile.dev.package]
+secp256k1 = { opt-level = 3 }
+secp256k1-sys = { opt-level = 3 }
+bitcoin_hashes = { opt-level = 3 }
+ff = { opt-level = 3 }
+group = { opt-level = 3 }
+tikv-jemalloc-sys = { opt-level = 3 }
+pairing = { opt-level = 3 }
+rand_core = { opt-level = 3 }
+byteorder = { opt-level = 3 }
+zeroize = { opt-level = 3 }
+bls12_381 = { opt-level = 3 }
+subtle = { opt-level = 3 }
+ring = { opt-level = 3 }
+
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = false
+
+[profile.release]
+debug = "line-tables-only"
