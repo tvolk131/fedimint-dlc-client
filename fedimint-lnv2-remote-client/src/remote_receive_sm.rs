@@ -9,7 +9,7 @@ use fedimint_lnv2_common::ContractId;
 use tracing::instrument;
 
 use crate::api::LightningFederationApi;
-use crate::db::{FundedContractKey, UnfundedContractKey};
+use crate::db::{FundedContractKey, ReceivedDlcOfferKey};
 use crate::LightningClientContext;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
@@ -115,7 +115,7 @@ impl RemoteReceiveStateMachine {
 
         let contract_and_claimer_pubkey_or = dbtx
             .module_tx()
-            .remove_entry(&UnfundedContractKey(contract_id))
+            .remove_entry(&ReceivedDlcOfferKey(contract_id))
             .await;
 
         // It's possible for `contract_and_claimer_pubkey_or` to be `None` if there was

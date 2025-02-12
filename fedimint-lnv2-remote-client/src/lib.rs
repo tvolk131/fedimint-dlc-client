@@ -8,24 +8,23 @@ mod api;
 #[cfg(feature = "cli")]
 mod cli;
 mod db;
+mod messages;
 mod remote_receive_sm;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::hash::Hash;
+use std::time::Duration;
 
-use async_stream::stream;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::sha256;
 use bitcoin::secp256k1;
-use db::{
-    ContractAndClaimerPubkey, FundedContractKey, FundedContractKeyPrefix, UnfundedContractKey,
-};
+use db::{ContractRole, DlcAcceptKey, DlcOfferAndMetadata, DlcOfferAndMetadataKey, DlcSignKey};
+use ddk_manager::contract::contract_info::ContractInfo;
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client::module::init::{ClientModuleInit, ClientModuleInitArgs};
 use fedimint_client::module::recovery::NoModuleBackup;
 use fedimint_client::module::{ClientContext, ClientModule};
 use fedimint_client::sm::util::MapStateTransitions;
 use fedimint_client::sm::{Context, DynState, ModuleNotifier, State, StateTransition};
-use fedimint_client::transaction::{ClientInput, ClientInputBundle};
 use fedimint_client::{sm_enum_variant_translation, DynGlobalClientContext};
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{Decoder, IntoDynInstance, ModuleInstanceId, ModuleKind, OperationId};
@@ -35,31 +34,24 @@ use fedimint_core::module::{
     ApiAuth, ApiVersion, CommonModuleInit, ModuleCommon, ModuleConsensusVersion, ModuleInit,
     MultiApiVersion,
 };
-use fedimint_core::time::duration_since_epoch;
-use fedimint_core::util::SafeUrl;
-use fedimint_core::{apply, async_trait_maybe_send, Amount};
+use fedimint_core::{apply, async_trait_maybe_send, Amount, BitcoinHash};
 use fedimint_lnv2_common::config::LightningClientConfig;
-use fedimint_lnv2_common::contracts::{IncomingContract, PaymentImage};
-use fedimint_lnv2_common::gateway_api::{
-    GatewayConnection, GatewayConnectionError, PaymentFee, RealGatewayConnection, RoutingInfo,
-};
+use fedimint_lnv2_common::contracts::IncomingContract;
 use fedimint_lnv2_common::{
-    Bolt11InvoiceDescription, ContractId, LightningInput, LightningInputV0, LightningModuleTypes,
-    MODULE_CONSENSUS_VERSION,
+    Bolt11InvoiceDescription, LightningModuleTypes, MODULE_CONSENSUS_VERSION,
 };
-use futures::StreamExt;
-use lightning_invoice::Bolt11Invoice;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-use secp256k1::{ecdh, Keypair, PublicKey, Scalar};
+use fedimint_mint_client::OOBNotes;
+use messages::{ContractId, DlcAccept, DlcOffer, DlcSign, PartyParams};
+use schnorr_fun::fun::marker::Normal;
+use schnorr_fun::fun::Point;
+use schnorr_fun::musig::AggKey;
+use secp256k1::{ecdh, Keypair, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
+use sha2::digest::Update;
+use sha2::Digest;
 use thiserror::Error;
-use tpe::{derive_agg_decryption_key, AggregateDecryptionKey};
 
-use crate::api::LightningFederationApi;
-use crate::remote_receive_sm::{
-    RemoteReceiveSMCommon, RemoteReceiveSMState, RemoteReceiveStateMachine,
-};
+use crate::remote_receive_sm::RemoteReceiveStateMachine;
 
 const KIND: ModuleKind = ModuleKind::from_static_str("lnv2");
 
@@ -92,15 +84,11 @@ impl CommonModuleInit for LightningRemoteCommonInit {
 }
 
 #[derive(Debug, Clone)]
-pub struct LightningRemoteClientInit {
-    pub gateway_conn: Arc<dyn GatewayConnection + Send + Sync>,
-}
+pub struct LightningRemoteClientInit;
 
 impl Default for LightningRemoteClientInit {
     fn default() -> Self {
-        LightningRemoteClientInit {
-            gateway_conn: Arc::new(RealGatewayConnection),
-        }
+        Self
     }
 }
 
@@ -135,7 +123,6 @@ impl ClientModuleInit for LightningRemoteClientInit {
             args.module_root_secret()
                 .clone()
                 .to_secp_key(fedimint_core::secp256k1::SECP256K1),
-            self.gateway_conn.clone(),
             args.admin_auth().cloned(),
         )
         .await)
@@ -157,7 +144,6 @@ pub struct LightningClientModule {
     client_ctx: ClientContext<Self>,
     module_api: DynModuleApi,
     keypair: Keypair,
-    gateway_conn: Arc<dyn GatewayConnection + Send + Sync>,
     #[allow(unused)] // The field is only used by the cli feature
     admin_auth: Option<ApiAuth>,
 }
@@ -199,14 +185,6 @@ impl ClientModule for LightningClientModule {
     }
 }
 
-fn generate_ephemeral_tweak(static_pk: PublicKey) -> ([u8; 32], PublicKey) {
-    let keypair = Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
-
-    let tweak = ecdh::SharedSecret::new(&static_pk, &keypair.secret_key());
-
-    (tweak.secret_bytes(), keypair.public_key())
-}
-
 impl LightningClientModule {
     #[allow(clippy::too_many_arguments)]
     async fn new(
@@ -216,7 +194,6 @@ impl LightningClientModule {
         client_ctx: ClientContext<Self>,
         module_api: DynModuleApi,
         keypair: Keypair,
-        gateway_conn: Arc<dyn GatewayConnection + Send + Sync>,
         admin_auth: Option<ApiAuth>,
     ) -> Self {
         Self {
@@ -226,427 +203,223 @@ impl LightningClientModule {
             client_ctx,
             module_api,
             keypair,
-            gateway_conn,
             admin_auth,
         }
     }
 
-    async fn get_random_gateway(&self) -> Result<(SafeUrl, RoutingInfo), SelectGatewayError> {
-        let mut gateways = self
-            .module_api
-            .gateways()
-            .await
-            .map_err(|e| SelectGatewayError::FederationError(e.to_string()))?;
-
-        if gateways.is_empty() {
-            return Err(SelectGatewayError::NoVettedGateways);
-        }
-
-        gateways.shuffle(&mut thread_rng());
-
-        for gateway in gateways {
-            if let Ok(Some(routing_info)) = self.routing_info(&gateway).await {
-                return Ok((gateway, routing_info));
-            }
-        }
-
-        Err(SelectGatewayError::FailedToFetchRoutingInfo)
-    }
-
-    async fn routing_info(
+    pub async fn create_offer(
         &self,
-        gateway: &SafeUrl,
-    ) -> Result<Option<RoutingInfo>, GatewayConnectionError> {
-        self.gateway_conn
-            .routing_info(gateway.clone(), &self.federation_id)
-            .await
-    }
+        funding_notes: OOBNotes,
+        funding_window: Duration,
+        contract_info: ContractInfo,
+        total_collateral: Amount,
+        contract_expiration: u32,
+        party_params: PartyParams, // TODO: Calculate this rather than accepting it as an argument.
+        expiration: u64,
+    ) -> anyhow::Result<DlcOffer> {
+        let contract_id = ContractId::new_random();
 
-    pub fn get_public_key(&self) -> PublicKey {
-        self.keypair.public_key()
-    }
-
-    /// Request an invoice. For testing you can optionally specify a gateway to
-    /// generate the invoice, otherwise a random online gateway will be selected
-    /// automatically.
-    ///
-    /// The total fee for this payment may depend on the chosen gateway but
-    /// will be limited to half of one percent plus fifty satoshis. Since the
-    /// selected gateway has been vetted by at least one guardian we trust it to
-    /// set a reasonable fee and only enforce a rather high limit.
-    ///
-    /// The absolute fee for a payment can be calculated from the operation meta
-    /// to be shown to the user in the transaction history.
-    pub async fn remote_receive(
-        &self,
-        claimer_pk: PublicKey,
-        amount: Amount,
-        expiry_secs: u32,
-        description: Bolt11InvoiceDescription,
-        gateway: Option<SafeUrl>,
-    ) -> Result<(Bolt11Invoice, OperationId), RemoteReceiveError> {
-        let (invoice, contract) = self
-            .create_contract_and_fetch_invoice(
-                claimer_pk,
-                amount,
-                expiry_secs,
-                description,
-                gateway,
-            )
-            .await?;
-
-        let operation_id = self
-            .start_remote_receive_state_machine(contract.clone(), claimer_pk)
-            .await;
-
-        self.client_ctx
-            .module_db()
-            .autocommit(
-                |dbtx, _| {
-                    Box::pin(async {
-                        dbtx.insert_new_entry(
-                            &UnfundedContractKey(contract.contract_id()),
-                            &ContractAndClaimerPubkey {
-                                contract: contract.clone(),
-                                claimer_pk,
-                            },
-                        )
-                        .await;
-
-                        Ok::<(), ()>(())
-                    })
-                },
-                None,
-            )
-            .await
-            .expect("Autocommit has no retry limit");
-
-        Ok((invoice, operation_id))
-    }
-
-    /// Await the final state of the remote receive operation.
-    /// Call this on a remote receiver with an operation ID returned by
-    /// `Self::remote_receive`.
-    pub async fn await_remote_receive(
-        &self,
-        operation_id: OperationId,
-    ) -> anyhow::Result<FinalRemoteReceiveOperationState> {
-        let operation = self.client_ctx.get_operation(operation_id).await?;
-        let mut stream = self.notifier.subscribe(operation_id).await;
-
-        // TODO: Do we need to use `outcome_or_updates` here?
-        // I'm using it here because the LNv2 client does.
-        Ok(self.client_ctx.outcome_or_updates(&operation, operation_id, || {
-            stream! {
-                loop {
-                    if let Some(LightningClientStateMachines::RemoteReceive(state)) = stream.next().await {
-                        match state.state {
-                            RemoteReceiveSMState::Pending => continue,
-                            RemoteReceiveSMState::Funded => {
-                                yield FinalRemoteReceiveOperationState::Funded;
-                                return;
-                            },
-                            RemoteReceiveSMState::Expired => {
-                                yield FinalRemoteReceiveOperationState::Expired;
-                                return;
-                            },
-                        }
-                    }
-                }
-            }
-        }).into_stream().next().await.expect("Stream contains one final state"))
-    }
-
-    /// Call this on a remote receiver to get a list of claimable contracts.
-    pub async fn get_claimable_contracts(
-        &self,
-        claimer_pk: PublicKey,
-        limit_or: Option<usize>,
-    ) -> Vec<IncomingContract> {
-        let mut dbtx = self.client_ctx.module_db().begin_transaction_nc().await;
-
-        let contract_stream = dbtx
-            .find_by_prefix(&FundedContractKeyPrefix)
-            .await
-            .filter_map(|c| async move {
-                if &c.1.claimer_pk == &claimer_pk {
-                    Some(c.1.contract)
-                } else {
-                    None
-                }
-            });
-
-        if let Some(limit) = limit_or {
-            contract_stream.take(limit).collect::<Vec<_>>().await
-        } else {
-            contract_stream.collect::<Vec<_>>().await
-        }
-    }
-
-    /// Idempotently remove a list of received contracts.
-    /// Call this on a remote receiver after receiving verification
-    /// from the claimer that the contracts have been claimed.
-    pub async fn remove_claimed_contracts(&self, contract_ids: Vec<ContractId>) {
-        self.client_ctx
-            .module_db()
-            .autocommit(
-                |dbtx, _| {
-                    Box::pin(async {
-                        for contract_id in &contract_ids {
-                            debug_assert!(
-                                dbtx.get_value(&UnfundedContractKey(*contract_id))
-                                    .await
-                                    .is_none(),
-                                "Should never have access to IDs of unclaimed contracts"
-                            );
-
-                            dbtx.remove_entry(&FundedContractKey(*contract_id)).await;
-                        }
-
-                        Ok::<(), ()>(())
-                    })
-                },
-                None,
-            )
-            .await
-            .expect("Autocommit has no retry limit");
-    }
-
-    pub async fn claim_contract(&self, contract: IncomingContract) -> anyhow::Result<()> {
-        let operation_id = OperationId::from_encodable(&contract.clone());
-
-        // TODO: Don't unwrap here.
-        let (claim_keypair, agg_decryption_key) = self.recover_contract_keys(&contract).unwrap();
-
-        let client_input = ClientInput::<LightningInput> {
-            input: LightningInput::V0(LightningInputV0::Incoming(
-                contract.contract_id(),
-                agg_decryption_key,
-            )),
-            amount: contract.commitment.amount,
-            keys: vec![claim_keypair],
-        };
+        let offer = DlcOffer::new(
+            contract_id.clone(),
+            party_params,
+            contract_info,
+            total_collateral,
+            expiration,
+        );
 
         let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
 
-        let (_txid, change_range) = self
-            .client_ctx
-            .claim_inputs(
-                &mut dbtx.to_ref_nc(),
-                ClientInputBundle::new_no_sm(vec![client_input]),
-                operation_id,
+        let existing_entry = dbtx
+            .insert_entry(
+                &DlcOfferAndMetadataKey(contract_id),
+                &DlcOfferAndMetadata {
+                    offer: offer.clone(),
+                    role: ContractRole::Offerer,
+                },
             )
-            .await
-            .expect("Cannot claim input, additional funding needed");
+            .await;
+
+        if existing_entry.is_some() {
+            return Err(anyhow::anyhow!("Contract ID already exists"));
+        }
 
         dbtx.commit_tx_result().await?;
 
-        // TODO: If this returns an error, it either means that the contract
-        // was already claimed, or the federation is malicious. Right now we
-        // don't distinguish between these cases and assume the contract was
-        // already claimed. We should distinguish between these cases in the
-        // future. To do this, we could either:
-        // 1. Add a claim state machine
-        // 2. Store a list of claimed contracts in the module db
-        let _ = self
-            .client_ctx
-            .await_primary_module_outputs(operation_id, change_range)
+        Ok(offer)
+    }
+
+    pub async fn accept_offer(
+        &self,
+        offer: DlcOffer,
+        funding_notes: OOBNotes,
+        party_params: PartyParams, // TODO: Calculate this rather than accepting it as an argument.
+    ) -> anyhow::Result<DlcAccept> {
+        let accept = DlcAccept::new(offer.contract_id.clone(), party_params, unimplemented!());
+
+        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
+
+        let existing_entry = dbtx
+            .insert_entry(
+                &DlcOfferAndMetadataKey(offer.contract_id),
+                &DlcOfferAndMetadata {
+                    offer: offer.clone(),
+                    role: ContractRole::Acceptor,
+                },
+            )
             .await;
+
+        if existing_entry.is_some() {
+            return Err(anyhow::anyhow!(
+                "Offer with this contract ID already exists"
+            ));
+        }
+
+        dbtx.insert_entry(&DlcAcceptKey(offer.contract_id), &accept)
+            .await;
+
+        if existing_entry.is_some() {
+            return Err(anyhow::anyhow!("Contract ID already exists"));
+        }
+
+        dbtx.commit_tx_result().await?;
+
+        Ok(accept)
+    }
+
+    pub async fn sign(&self, accept: DlcAccept) -> anyhow::Result<DlcSign> {
+        let contract_id = accept.contract_id;
+
+        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
+
+        let offer_and_metadata = dbtx
+            .get_value(&DlcOfferAndMetadataKey(contract_id.clone()))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No offer found for contract ID"))?;
+
+        if offer_and_metadata.role != ContractRole::Offerer {
+            return Err(anyhow::anyhow!("The acceptor cannot sign"));
+        }
+
+        let sign = DlcSign::new(contract_id, unimplemented!(), unimplemented!());
+
+        dbtx.insert_entry(&DlcSignKey(contract_id), &sign).await;
+
+        dbtx.commit_tx_result().await?;
+
+        Ok(sign)
+    }
+
+    pub async fn sign_and_publish_funding_tx(&self, sign: DlcSign) -> anyhow::Result<()> {
+        let contract_id = sign.contract_id;
+
+        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
+
+        let accept: DlcAccept = dbtx
+            .get_value(&DlcAcceptKey(contract_id.clone()))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No accept found for contract ID"))?;
+
+        let offer_and_metadata = dbtx
+            .get_value(&DlcOfferAndMetadataKey(contract_id.clone()))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No offer found for contract ID"))?;
+
+        if offer_and_metadata.role != ContractRole::Acceptor {
+            return Err(anyhow::anyhow!("The offerer cannot publish"));
+        }
+
+        let sign = DlcSign::new(contract_id, unimplemented!(), unimplemented!());
+
+        dbtx.insert_entry(&DlcSignKey(contract_id), &sign).await;
+
+        // TODO: Publish the funding transaction.
+
+        dbtx.commit_tx_result().await?;
 
         Ok(())
     }
-
-    /// Create an incoming contract locked to a specified public key and fetch
-    /// the corresponding invoice.
-    async fn create_contract_and_fetch_invoice(
-        &self,
-        claimer_pk: PublicKey,
-        amount: Amount,
-        expiry_secs: u32,
-        description: Bolt11InvoiceDescription,
-        gateway: Option<SafeUrl>,
-    ) -> Result<(Bolt11Invoice, IncomingContract), RemoteReceiveError> {
-        let (ephemeral_tweak, ephemeral_pk) = generate_ephemeral_tweak(claimer_pk);
-
-        let encryption_seed = ephemeral_tweak
-            .consensus_hash::<sha256::Hash>()
-            .to_byte_array();
-
-        let preimage = encryption_seed
-            .consensus_hash::<sha256::Hash>()
-            .to_byte_array();
-
-        let (gateway, routing_info) = match gateway {
-            Some(gateway) => (
-                gateway.clone(),
-                self.routing_info(&gateway)
-                    .await
-                    .map_err(RemoteReceiveError::GatewayConnectionError)?
-                    .ok_or(RemoteReceiveError::UnknownFederation)?,
-            ),
-            None => self
-                .get_random_gateway()
-                .await
-                .map_err(RemoteReceiveError::FailedToSelectGateway)?,
-        };
-
-        if !routing_info.receive_fee.le(&PaymentFee::RECEIVE_FEE_LIMIT) {
-            return Err(RemoteReceiveError::PaymentFeeExceedsLimit);
-        }
-
-        let contract_amount = routing_info.receive_fee.subtract_from(amount.msats);
-
-        // The dust limit ensures that the incoming contract can be claimed without
-        // additional funds as the contracts amount is sufficient to cover the fees
-        if contract_amount < Amount::from_sats(50) {
-            return Err(RemoteReceiveError::DustAmount);
-        }
-
-        let expiration = duration_since_epoch()
-            .as_secs()
-            .saturating_add(u64::from(expiry_secs));
-
-        let claim_pk = claimer_pk
-            .mul_tweak(
-                secp256k1::SECP256K1,
-                &Scalar::from_be_bytes(ephemeral_tweak).expect("Within curve order"),
-            )
-            .expect("Tweak is valid");
-
-        let contract = IncomingContract::new(
-            self.cfg.tpe_agg_pk,
-            encryption_seed,
-            preimage,
-            PaymentImage::Hash(preimage.consensus_hash()),
-            contract_amount,
-            expiration,
-            claim_pk,
-            routing_info.module_public_key,
-            ephemeral_pk,
-        );
-
-        let invoice = self
-            .gateway_conn
-            .bolt11_invoice(
-                gateway,
-                self.federation_id,
-                contract.clone(),
-                amount,
-                description,
-                expiry_secs,
-            )
-            .await
-            .map_err(RemoteReceiveError::GatewayConnectionError)?;
-
-        if invoice.payment_hash() != &preimage.consensus_hash() {
-            return Err(RemoteReceiveError::InvalidInvoicePaymentHash);
-        }
-
-        if invoice.amount_milli_satoshis() != Some(amount.msats) {
-            return Err(RemoteReceiveError::InvalidInvoiceAmount);
-        }
-
-        Ok((invoice, contract))
-    }
-
-    /// Start a remote receive state machine that waits
-    /// for an incoming contract to be funded or to expire.
-    async fn start_remote_receive_state_machine(
-        &self,
-        contract: IncomingContract,
-        claimer_pubkey: PublicKey,
-    ) -> OperationId {
-        let operation_id = OperationId::from_encodable(&contract.clone());
-
-        let receive_sm = LightningClientStateMachines::RemoteReceive(RemoteReceiveStateMachine {
-            common: RemoteReceiveSMCommon {
-                operation_id,
-                claimer_pubkey,
-                contract: contract.clone(),
-            },
-            state: RemoteReceiveSMState::Pending,
-        });
-
-        // this may only fail if the operation id is already in use, in which case we
-        // ignore the error such that the method is idempotent
-        self.client_ctx
-            .manual_operation_start(
-                operation_id,
-                LightningRemoteCommonInit::KIND.as_str(),
-                OperationMeta { contract },
-                vec![self.client_ctx.make_dyn_state(receive_sm)],
-            )
-            .await
-            .ok();
-
-        operation_id
-    }
-
-    fn recover_contract_keys(
-        &self,
-        contract: &IncomingContract,
-    ) -> Option<(Keypair, AggregateDecryptionKey)> {
-        let ephemeral_tweak = ecdh::SharedSecret::new(
-            &contract.commitment.ephemeral_pk,
-            &self.keypair.secret_key(),
-        )
-        .secret_bytes();
-
-        let encryption_seed = ephemeral_tweak
-            .consensus_hash::<sha256::Hash>()
-            .to_byte_array();
-
-        let claim_keypair = self
-            .keypair
-            .secret_key()
-            .mul_tweak(&Scalar::from_be_bytes(ephemeral_tweak).expect("Within curve order"))
-            .expect("Tweak is valid")
-            .keypair(secp256k1::SECP256K1);
-
-        if claim_keypair.public_key() != contract.commitment.claim_pk {
-            return None; // The claim key is not derived from our pk
-        }
-
-        let agg_decryption_key = derive_agg_decryption_key(&self.cfg.tpe_agg_pk, &encryption_seed);
-
-        if !contract.verify_agg_decryption_key(&self.cfg.tpe_agg_pk, &agg_decryption_key) {
-            return None; // The decryption key is not derived from our pk
-        }
-
-        contract.decrypt_preimage(&agg_decryption_key)?;
-
-        Some((claim_keypair, agg_decryption_key))
-    }
 }
 
-#[derive(Error, Debug, Clone, Eq, PartialEq)]
-pub enum SelectGatewayError {
-    #[error("Federation returned an error: {0}")]
-    FederationError(String),
-    #[error("The federation has no vetted gateways")]
-    NoVettedGateways,
-    #[error("All vetted gateways failed to respond on request of the routing info")]
-    FailedToFetchRoutingInfo,
+fn calculate_payment_preimage(offer: &DlcOffer, accept: &DlcAccept) -> [u8; 32] {
+    // Since we hash the offer and accept messages to create the ephemeral pubkey,
+    // we double-hash here to ensure that outside viewers cannot correlate the two.
+    // The pre-image is double-hashed rather than the ephemeral pubkey because the
+    // pre-image needs to be publicly revealed to submit a CET, and we don't want
+    // others to be able to correlate the pre-image with the ephemeral pubkey.
+    let offer_hash_bytes: [u8; 32] = offer
+        .consensus_hash::<sha256::Hash>()
+        .hash_again()
+        .to_byte_array();
+    let accept_hash_bytes: [u8; 32] = accept
+        .consensus_hash::<sha256::Hash>()
+        .hash_again()
+        .to_byte_array();
+
+    xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes)
+}
+
+fn calculate_ephemeral_pubkey(offer: &DlcOffer, accept: &DlcAccept) -> PublicKey {
+    // Note: We perform a single hash here, but we double-hash these same messages
+    // to create the contract pre-image. See `calculate_payment_preimage` for why.
+    let offer_hash_bytes: [u8; 32] = offer.consensus_hash::<sha256::Hash>().to_byte_array();
+    let accept_hash_bytes: [u8; 32] = accept.consensus_hash::<sha256::Hash>().to_byte_array();
+
+    let secret_bytes = xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes);
+
+    let secret_key = SecretKey::from_slice(&secret_bytes).expect("Always 32 bytes");
+
+    secret_key.public_key(secp256k1::SECP256K1)
+}
+
+fn xor_32_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x ^ y)
+        .collect::<Vec<u8>>()
+        .try_into()
+        .expect("Always 32 bytes")
+}
+
+fn get_claim_agg_key(dlc_offer: &DlcOffer, dlc_accept: &DlcAccept) -> AggKey<Normal> {
+    let schnorr = schnorr_fun::Schnorr::<
+        sha2::Sha256,
+        schnorr_fun::nonce::Deterministic<sha2::Sha256>,
+    >::default();
+    let musig = schnorr_fun::musig::MuSig::new(schnorr);
+
+    // TODO: Simply call `PublicKey.into()` once `schnorr_fun` and
+    // `bitcoin` are updated to use the same `secp256k1` version.
+    musig.new_agg_key(vec![
+        Point::from_bytes(dlc_offer.party_params.claim_pubkey().serialize())
+            .expect("Invalid pubkey"),
+        Point::from_bytes(dlc_accept.party_params.claim_pubkey().serialize())
+            .expect("Invalid pubkey"),
+    ])
+}
+
+fn get_refund_agg_key(dlc_offer: &DlcOffer, dlc_accept: &DlcAccept) -> AggKey<Normal> {
+    let schnorr = schnorr_fun::Schnorr::<
+        sha2::Sha256,
+        schnorr_fun::nonce::Deterministic<sha2::Sha256>,
+    >::default();
+    let musig = schnorr_fun::musig::MuSig::new(schnorr);
+
+    // TODO: Simply call `PublicKey.into()` once `schnorr_fun` and `bitcoin`
+    // are updated to use the same `secp256k1` version.
+    musig.new_agg_key(vec![
+        Point::from_bytes(dlc_offer.party_params.refund_pubkey().serialize())
+            .expect("Invalid pubkey"),
+        Point::from_bytes(dlc_accept.party_params.refund_pubkey().serialize())
+            .expect("Invalid pubkey"),
+    ])
 }
 
 #[derive(Error, Debug, Clone, Eq, PartialEq)]
 pub enum RemoteReceiveError {
-    #[error("Failed to select gateway: {0}")]
-    FailedToSelectGateway(SelectGatewayError),
-    #[error("Gateway connection error: {0}")]
-    GatewayConnectionError(GatewayConnectionError),
-    #[error("The gateway does not support our federation")]
-    UnknownFederation,
     #[error("The gateways fee exceeds the limit")]
     PaymentFeeExceedsLimit,
     #[error("The total fees required to complete this payment exceed its amount")]
     DustAmount,
-    #[error("The invoice's payment hash is incorrect")]
-    InvalidInvoicePaymentHash,
-    #[error("The invoice's amount is incorrect")]
-    InvalidInvoiceAmount,
-    #[error("The pubkey of the claimer is not registered")]
-    UnregisteredClaimer,
 }
 
 // TODO: Remove this and just use `RemoteReceiveStateMachine`.

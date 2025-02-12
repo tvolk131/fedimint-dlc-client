@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-cli = ["dep:clap", "dep:hex", "dep:bincode"]
+cli = ["dep:clap", "dep:hex"]
 
 [dependencies]
 aquamarine = "0.6.0"
@@ -20,10 +20,13 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 bitcoin = { workspace = true }
-bincode = { version = "1.3.3", optional = true }
+bincode = { workspace = true }
+ddk-manager = "0.7.3"
 hex = { version = "0.4.3", optional = true }
 clap = { workspace = true, optional = true }
 fedimint-api-client = { workspace = true }
+fedimint-mint-client = { workspace = true }
+fedimint-mint-common = { workspace = true }
 fedimint-client = { workspace = true }
 fedimint-core = { workspace = true }
 fedimint-lnv2-common = { workspace = true }

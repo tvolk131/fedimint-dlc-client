@@ -1,50 +1,66 @@
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::{impl_db_lookup, impl_db_record};
-use fedimint_lnv2_common::contracts::IncomingContract;
-use fedimint_lnv2_common::ContractId;
+
+use crate::messages::{ContractId, DlcAccept, DlcOffer, DlcSign};
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct DlcOfferAndMetadata {
+    pub offer: DlcOffer,
+    pub role: ContractRole,
+}
+
+#[derive(Debug, Clone, Encodable, Decodable, PartialEq, Eq)]
+pub enum ContractRole {
+    Offerer = 0,
+    Acceptor = 1,
+}
 
 #[repr(u8)]
 #[derive(Clone, Debug)]
 pub enum DbKeyPrefix {
-    UnfundedContract = 0xb1,
-    FundedContract = 0xb2,
+    DlcOfferAndMetadata = 0xb1,
+    DlcAccept = 0xb2,
+    DlcSign = 0xb3,
 }
 
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct UnfundedContractKey(pub ContractId);
+pub struct DlcOfferAndMetadataKey(pub ContractId);
 
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct UnfundedContractKeyPrefix;
+pub struct DlcOfferAndMetadataKeyPrefix;
 
 impl_db_record!(
-    key = UnfundedContractKey,
-    value = ContractAndClaimerPubkey,
-    db_prefix = DbKeyPrefix::UnfundedContract,
+    key = DlcOfferAndMetadataKey,
+    value = DlcOfferAndMetadata,
+    db_prefix = DbKeyPrefix::DlcOfferAndMetadata,
 );
 impl_db_lookup!(
-    key = UnfundedContractKey,
-    query_prefix = UnfundedContractKeyPrefix
+    key = DlcOfferAndMetadataKey,
+    query_prefix = DlcOfferAndMetadataKeyPrefix
 );
 
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct FundedContractKey(pub ContractId);
+pub struct DlcAcceptKey(pub ContractId);
 
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct FundedContractKeyPrefix;
+pub struct DlcAcceptKeyPrefix;
 
 impl_db_record!(
-    key = FundedContractKey,
-    value = ContractAndClaimerPubkey,
-    db_prefix = DbKeyPrefix::FundedContract,
+    key = DlcAcceptKey,
+    value = DlcAccept,
+    db_prefix = DbKeyPrefix::DlcAccept,
 );
-impl_db_lookup!(
-    key = FundedContractKey,
-    query_prefix = FundedContractKeyPrefix
-);
+impl_db_lookup!(key = DlcAcceptKey, query_prefix = DlcAcceptKeyPrefix);
 
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct ContractAndClaimerPubkey {
-    pub contract: IncomingContract,
-    pub claimer_pk: PublicKey,
-}
+pub struct DlcSignKey(pub ContractId);
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct DlcSignKeyPrefix;
+
+impl_db_record!(
+    key = DlcSignKey,
+    value = DlcSign,
+    db_prefix = DbKeyPrefix::DlcSign,
+);
+impl_db_lookup!(key = DlcSignKey, query_prefix = DlcSignKeyPrefix);
