@@ -9,49 +9,38 @@ mod api;
 mod cli;
 mod db;
 mod messages;
-mod remote_receive_sm;
 
 use std::collections::BTreeMap;
 use std::hash::Hash;
 use std::time::Duration;
 
-use bitcoin::hashes::sha256;
-use bitcoin::secp256k1;
-use db::{ContractRole, DlcAcceptKey, DlcOfferAndMetadata, DlcOfferAndMetadataKey, DlcSignKey};
+use bitcoin::secp256k1::Keypair;
+use db::{insert_accepted_contract, insert_offered_contract, insert_signed_contract};
 use ddk_manager::contract::contract_info::ContractInfo;
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client::module::init::{ClientModuleInit, ClientModuleInitArgs};
 use fedimint_client::module::recovery::NoModuleBackup;
 use fedimint_client::module::{ClientContext, ClientModule};
-use fedimint_client::sm::util::MapStateTransitions;
 use fedimint_client::sm::{Context, DynState, ModuleNotifier, State, StateTransition};
-use fedimint_client::{sm_enum_variant_translation, DynGlobalClientContext};
+use fedimint_client::DynGlobalClientContext;
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{Decoder, IntoDynInstance, ModuleInstanceId, ModuleKind, OperationId};
-use fedimint_core::db::{DatabaseTransaction, IDatabaseTransactionOpsCoreTyped};
+use fedimint_core::db::DatabaseTransaction;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{
     ApiAuth, ApiVersion, CommonModuleInit, ModuleCommon, ModuleConsensusVersion, ModuleInit,
     MultiApiVersion,
 };
-use fedimint_core::{apply, async_trait_maybe_send, Amount, BitcoinHash};
+use fedimint_core::{apply, async_trait_maybe_send, Amount};
 use fedimint_lnv2_common::config::LightningClientConfig;
 use fedimint_lnv2_common::contracts::IncomingContract;
-use fedimint_lnv2_common::{
-    Bolt11InvoiceDescription, LightningModuleTypes, MODULE_CONSENSUS_VERSION,
-};
+use fedimint_lnv2_common::{LightningModuleTypes, MODULE_CONSENSUS_VERSION};
 use fedimint_mint_client::OOBNotes;
-use messages::{ContractId, DlcAccept, DlcOffer, DlcSign, PartyParams};
-use schnorr_fun::fun::marker::Normal;
-use schnorr_fun::fun::Point;
-use schnorr_fun::musig::AggKey;
-use secp256k1::{ecdh, Keypair, PublicKey, SecretKey};
+use messages::{
+    ContractId, ContractRole, DlcAccept, DlcOffer, DlcSign, OfferedContract, PartyParams,
+};
 use serde::{Deserialize, Serialize};
-use sha2::digest::Update;
-use sha2::Digest;
 use thiserror::Error;
-
-use crate::remote_receive_sm::RemoteReceiveStateMachine;
 
 const KIND: ModuleKind = ModuleKind::from_static_str("lnv2");
 
@@ -100,6 +89,7 @@ impl ModuleInit for LightningRemoteClientInit {
         _dbtx: &mut DatabaseTransaction<'_>,
         _prefix_names: Vec<String>,
     ) -> Box<dyn Iterator<Item = (String, Box<dyn erased_serde::Serialize + Send>)> + '_> {
+        // TODO: Implement this.
         Box::new(BTreeMap::new().into_iter())
     }
 }
@@ -124,8 +114,7 @@ impl ClientModuleInit for LightningRemoteClientInit {
                 .clone()
                 .to_secp_key(fedimint_core::secp256k1::SECP256K1),
             args.admin_auth().cloned(),
-        )
-        .await)
+        ))
     }
 }
 
@@ -140,7 +129,7 @@ impl Context for LightningClientContext {
 pub struct LightningClientModule {
     federation_id: FederationId,
     cfg: LightningClientConfig,
-    notifier: ModuleNotifier<LightningClientStateMachines>,
+    notifier: ModuleNotifier<DlcClientStateMachines>,
     client_ctx: ClientContext<Self>,
     module_api: DynModuleApi,
     keypair: Keypair,
@@ -154,7 +143,7 @@ impl ClientModule for LightningClientModule {
     type Common = LightningModuleTypes;
     type Backup = NoModuleBackup;
     type ModuleStateMachineContext = LightningClientContext;
-    type States = LightningClientStateMachines;
+    type States = DlcClientStateMachines;
 
     fn context(&self) -> Self::ModuleStateMachineContext {
         LightningClientContext {}
@@ -187,10 +176,10 @@ impl ClientModule for LightningClientModule {
 
 impl LightningClientModule {
     #[allow(clippy::too_many_arguments)]
-    async fn new(
+    fn new(
         federation_id: FederationId,
         cfg: LightningClientConfig,
-        notifier: ModuleNotifier<LightningClientStateMachines>,
+        notifier: ModuleNotifier<DlcClientStateMachines>,
         client_ctx: ClientContext<Self>,
         module_api: DynModuleApi,
         keypair: Keypair,
@@ -219,7 +208,7 @@ impl LightningClientModule {
     ) -> anyhow::Result<DlcOffer> {
         let contract_id = ContractId::new_random();
 
-        let offer = DlcOffer::new(
+        let dlc_offer = DlcOffer::new(
             contract_id.clone(),
             party_params,
             contract_info,
@@ -229,189 +218,81 @@ impl LightningClientModule {
 
         let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
 
-        let existing_entry = dbtx
-            .insert_entry(
-                &DlcOfferAndMetadataKey(contract_id),
-                &DlcOfferAndMetadata {
-                    offer: offer.clone(),
-                    role: ContractRole::Offerer,
-                },
-            )
-            .await;
-
-        if existing_entry.is_some() {
-            return Err(anyhow::anyhow!("Contract ID already exists"));
-        }
+        insert_offered_contract(
+            &mut dbtx.to_ref_nc(),
+            OfferedContract {
+                role: ContractRole::Offerer,
+                dlc_offer: dlc_offer.clone(),
+            },
+        )
+        .await?;
 
         dbtx.commit_tx_result().await?;
 
-        Ok(offer)
+        Ok(dlc_offer)
     }
 
     pub async fn accept_offer(
         &self,
-        offer: DlcOffer,
+        dlc_offer: DlcOffer,
         funding_notes: OOBNotes,
         party_params: PartyParams, // TODO: Calculate this rather than accepting it as an argument.
     ) -> anyhow::Result<DlcAccept> {
-        let accept = DlcAccept::new(offer.contract_id.clone(), party_params, unimplemented!());
+        let dlc_accept = DlcAccept::new(
+            dlc_offer.contract_id.clone(),
+            party_params,
+            unimplemented!(),
+        );
 
         let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
 
-        let existing_entry = dbtx
-            .insert_entry(
-                &DlcOfferAndMetadataKey(offer.contract_id),
-                &DlcOfferAndMetadata {
-                    offer: offer.clone(),
-                    role: ContractRole::Acceptor,
-                },
-            )
-            .await;
+        insert_offered_contract(
+            &mut dbtx.to_ref_nc(),
+            OfferedContract {
+                role: ContractRole::Acceptor,
+                dlc_offer,
+            },
+        )
+        .await?;
 
-        if existing_entry.is_some() {
+        insert_accepted_contract(&mut dbtx.to_ref_nc(), dlc_accept).await?;
+
+        dbtx.commit_tx_result().await?;
+
+        Ok(dlc_accept)
+    }
+
+    pub async fn sign(&self, dlc_accept: DlcAccept) -> anyhow::Result<DlcSign> {
+        let dlc_sign = DlcSign::new(dlc_accept.contract_id, unimplemented!(), unimplemented!());
+
+        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
+
+        insert_accepted_contract(&mut dbtx.to_ref_nc(), dlc_accept).await?;
+
+        insert_signed_contract(&mut dbtx.to_ref_nc(), dlc_sign).await?;
+
+        dbtx.commit_tx_result().await?;
+
+        Ok(dlc_sign)
+    }
+
+    pub async fn finalize_and_publish_funding_tx(&self, dlc_sign: DlcSign) -> anyhow::Result<()> {
+        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
+
+        let accepted_contract = insert_signed_contract(&mut dbtx.to_ref_nc(), dlc_sign).await?;
+
+        if accepted_contract.offered_contract.role != ContractRole::Acceptor {
             return Err(anyhow::anyhow!(
-                "Offer with this contract ID already exists"
+                "The offerer cannot publish, only the acceptor"
             ));
         }
 
-        dbtx.insert_entry(&DlcAcceptKey(offer.contract_id), &accept)
-            .await;
-
-        if existing_entry.is_some() {
-            return Err(anyhow::anyhow!("Contract ID already exists"));
-        }
-
-        dbtx.commit_tx_result().await?;
-
-        Ok(accept)
-    }
-
-    pub async fn sign(&self, accept: DlcAccept) -> anyhow::Result<DlcSign> {
-        let contract_id = accept.contract_id;
-
-        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
-
-        let offer_and_metadata = dbtx
-            .get_value(&DlcOfferAndMetadataKey(contract_id.clone()))
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No offer found for contract ID"))?;
-
-        if offer_and_metadata.role != ContractRole::Offerer {
-            return Err(anyhow::anyhow!("The acceptor cannot sign"));
-        }
-
-        let sign = DlcSign::new(contract_id, unimplemented!(), unimplemented!());
-
-        dbtx.insert_entry(&DlcSignKey(contract_id), &sign).await;
-
-        dbtx.commit_tx_result().await?;
-
-        Ok(sign)
-    }
-
-    pub async fn sign_and_publish_funding_tx(&self, sign: DlcSign) -> anyhow::Result<()> {
-        let contract_id = sign.contract_id;
-
-        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
-
-        let accept: DlcAccept = dbtx
-            .get_value(&DlcAcceptKey(contract_id.clone()))
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No accept found for contract ID"))?;
-
-        let offer_and_metadata = dbtx
-            .get_value(&DlcOfferAndMetadataKey(contract_id.clone()))
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No offer found for contract ID"))?;
-
-        if offer_and_metadata.role != ContractRole::Acceptor {
-            return Err(anyhow::anyhow!("The offerer cannot publish"));
-        }
-
-        let sign = DlcSign::new(contract_id, unimplemented!(), unimplemented!());
-
-        dbtx.insert_entry(&DlcSignKey(contract_id), &sign).await;
-
-        // TODO: Publish the funding transaction.
+        // TODO: Start state machine that publishes the funding transaction.
 
         dbtx.commit_tx_result().await?;
 
         Ok(())
     }
-}
-
-fn calculate_payment_preimage(offer: &DlcOffer, accept: &DlcAccept) -> [u8; 32] {
-    // Since we hash the offer and accept messages to create the ephemeral pubkey,
-    // we double-hash here to ensure that outside viewers cannot correlate the two.
-    // The pre-image is double-hashed rather than the ephemeral pubkey because the
-    // pre-image needs to be publicly revealed to submit a CET, and we don't want
-    // others to be able to correlate the pre-image with the ephemeral pubkey.
-    let offer_hash_bytes: [u8; 32] = offer
-        .consensus_hash::<sha256::Hash>()
-        .hash_again()
-        .to_byte_array();
-    let accept_hash_bytes: [u8; 32] = accept
-        .consensus_hash::<sha256::Hash>()
-        .hash_again()
-        .to_byte_array();
-
-    xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes)
-}
-
-fn calculate_ephemeral_pubkey(offer: &DlcOffer, accept: &DlcAccept) -> PublicKey {
-    // Note: We perform a single hash here, but we double-hash these same messages
-    // to create the contract pre-image. See `calculate_payment_preimage` for why.
-    let offer_hash_bytes: [u8; 32] = offer.consensus_hash::<sha256::Hash>().to_byte_array();
-    let accept_hash_bytes: [u8; 32] = accept.consensus_hash::<sha256::Hash>().to_byte_array();
-
-    let secret_bytes = xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes);
-
-    let secret_key = SecretKey::from_slice(&secret_bytes).expect("Always 32 bytes");
-
-    secret_key.public_key(secp256k1::SECP256K1)
-}
-
-fn xor_32_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| x ^ y)
-        .collect::<Vec<u8>>()
-        .try_into()
-        .expect("Always 32 bytes")
-}
-
-fn get_claim_agg_key(dlc_offer: &DlcOffer, dlc_accept: &DlcAccept) -> AggKey<Normal> {
-    let schnorr = schnorr_fun::Schnorr::<
-        sha2::Sha256,
-        schnorr_fun::nonce::Deterministic<sha2::Sha256>,
-    >::default();
-    let musig = schnorr_fun::musig::MuSig::new(schnorr);
-
-    // TODO: Simply call `PublicKey.into()` once `schnorr_fun` and
-    // `bitcoin` are updated to use the same `secp256k1` version.
-    musig.new_agg_key(vec![
-        Point::from_bytes(dlc_offer.party_params.claim_pubkey().serialize())
-            .expect("Invalid pubkey"),
-        Point::from_bytes(dlc_accept.party_params.claim_pubkey().serialize())
-            .expect("Invalid pubkey"),
-    ])
-}
-
-fn get_refund_agg_key(dlc_offer: &DlcOffer, dlc_accept: &DlcAccept) -> AggKey<Normal> {
-    let schnorr = schnorr_fun::Schnorr::<
-        sha2::Sha256,
-        schnorr_fun::nonce::Deterministic<sha2::Sha256>,
-    >::default();
-    let musig = schnorr_fun::musig::MuSig::new(schnorr);
-
-    // TODO: Simply call `PublicKey.into()` once `schnorr_fun` and `bitcoin`
-    // are updated to use the same `secp256k1` version.
-    musig.new_agg_key(vec![
-        Point::from_bytes(dlc_offer.party_params.refund_pubkey().serialize())
-            .expect("Invalid pubkey"),
-        Point::from_bytes(dlc_accept.party_params.refund_pubkey().serialize())
-            .expect("Invalid pubkey"),
-    ])
 }
 
 #[derive(Error, Debug, Clone, Eq, PartialEq)]
@@ -422,13 +303,11 @@ pub enum RemoteReceiveError {
     DustAmount,
 }
 
-// TODO: Remove this and just use `RemoteReceiveStateMachine`.
+// TODO: Add some state machine variants here.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
-pub enum LightningClientStateMachines {
-    RemoteReceive(RemoteReceiveStateMachine),
-}
+pub enum DlcClientStateMachines {}
 
-impl IntoDynInstance for LightningClientStateMachines {
+impl IntoDynInstance for DlcClientStateMachines {
     type DynType = DynState;
 
     fn into_dyn(self, instance_id: ModuleInstanceId) -> Self::DynType {
@@ -436,27 +315,18 @@ impl IntoDynInstance for LightningClientStateMachines {
     }
 }
 
-impl State for LightningClientStateMachines {
+impl State for DlcClientStateMachines {
     type ModuleContext = LightningClientContext;
 
     fn transitions(
         &self,
-        context: &Self::ModuleContext,
-        global_context: &DynGlobalClientContext,
+        _context: &Self::ModuleContext,
+        _global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
-        match self {
-            LightningClientStateMachines::RemoteReceive(state) => {
-                sm_enum_variant_translation!(
-                    state.transitions(context, global_context),
-                    LightningClientStateMachines::RemoteReceive
-                )
-            }
-        }
+        unimplemented!()
     }
 
     fn operation_id(&self) -> OperationId {
-        match self {
-            LightningClientStateMachines::RemoteReceive(state) => state.operation_id(),
-        }
+        unimplemented!()
     }
 }
