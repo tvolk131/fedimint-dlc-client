@@ -4,14 +4,13 @@ use ddk_manager::contract::contract_info::ContractInfo;
 use ddk_manager::contract::ser::Serializable;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{Amount, BitcoinHash};
+use fedimint_lnv2_common::contracts::{OutgoingContract, PaymentImage};
 use fedimint_mint_common::Note;
 use rand::{thread_rng, Rng};
 use schnorr_fun::adaptor::EncryptedSignature;
-use schnorr_fun::fun::marker::Normal;
 use schnorr_fun::fun::marker::{Public, Zero};
 use schnorr_fun::fun::Point;
 use schnorr_fun::fun::Scalar;
-use schnorr_fun::musig::AggKey;
 use schnorr_fun::musig::Nonce;
 use secp256k1::schnorr::Signature;
 
@@ -46,17 +45,33 @@ pub struct AcceptedContract {
 }
 
 impl AcceptedContract {
-    pub fn calculate_payment_preimage(offer: &DlcOffer, accept: &DlcAccept) -> [u8; 32] {
+    pub fn calculate_lnv2_outgoing_contract(&self) -> OutgoingContract {
+        OutgoingContract {
+            payment_image: PaymentImage::Hash(sha256::Hash::hash(
+                &self.calculate_payment_preimage(),
+            )),
+            amount: self.offered_contract.dlc_offer.total_collateral,
+            expiration: self.offered_contract.dlc_offer.expiration,
+            claim_pk: self.calculate_claim_agg_key(),
+            refund_pk: self.calculate_refund_agg_key(),
+            ephemeral_pk: self.calculate_ephemeral_pubkey(),
+        }
+    }
+
+    pub fn calculate_payment_preimage(&self) -> [u8; 32] {
         // Since we hash the offer and accept messages to create the ephemeral pubkey,
         // we double-hash here to ensure that outside viewers cannot correlate the two.
         // The pre-image is double-hashed rather than the ephemeral pubkey because the
         // pre-image needs to be publicly revealed to submit a CET, and we don't want
         // others to be able to correlate the pre-image with the ephemeral pubkey.
-        let offer_hash_bytes: [u8; 32] = offer
+        let offer_hash_bytes: [u8; 32] = self
+            .offered_contract
+            .dlc_offer
             .consensus_hash::<sha256::Hash>()
             .hash_again()
             .to_byte_array();
-        let accept_hash_bytes: [u8; 32] = accept
+        let accept_hash_bytes: [u8; 32] = self
+            .dlc_accept
             .consensus_hash::<sha256::Hash>()
             .hash_again()
             .to_byte_array();
@@ -64,20 +79,7 @@ impl AcceptedContract {
         Self::xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes)
     }
 
-    pub fn calculate_ephemeral_pubkey(offer: &DlcOffer, accept: &DlcAccept) -> PublicKey {
-        // Note: We perform a single hash here, but we double-hash these same messages
-        // to create the contract pre-image. See `calculate_payment_preimage()` for why.
-        let offer_hash_bytes: [u8; 32] = offer.consensus_hash::<sha256::Hash>().to_byte_array();
-        let accept_hash_bytes: [u8; 32] = accept.consensus_hash::<sha256::Hash>().to_byte_array();
-
-        let secret_bytes = Self::xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes);
-
-        let secret_key = SecretKey::from_slice(&secret_bytes).expect("Always 32 bytes");
-
-        secret_key.public_key(secp256k1::SECP256K1)
-    }
-
-    pub fn get_claim_agg_key(dlc_offer: &DlcOffer, dlc_accept: &DlcAccept) -> AggKey<Normal> {
+    fn calculate_claim_agg_key(&self) -> PublicKey {
         let schnorr = schnorr_fun::Schnorr::<
             sha2::Sha256,
             schnorr_fun::nonce::Deterministic<sha2::Sha256>,
@@ -86,15 +88,23 @@ impl AcceptedContract {
 
         // TODO: Simply call `PublicKey.into()` once `schnorr_fun` and
         // `bitcoin` are updated to use the same `secp256k1` version.
-        musig.new_agg_key(vec![
-            Point::from_bytes(dlc_offer.party_params.claim_pubkey().serialize())
+        let agg_key = musig.new_agg_key(vec![
+            Point::from_bytes(
+                self.offered_contract
+                    .dlc_offer
+                    .party_params
+                    .claim_pubkey()
+                    .serialize(),
+            )
+            .expect("Invalid pubkey"),
+            Point::from_bytes(self.dlc_accept.party_params.claim_pubkey().serialize())
                 .expect("Invalid pubkey"),
-            Point::from_bytes(dlc_accept.party_params.claim_pubkey().serialize())
-                .expect("Invalid pubkey"),
-        ])
+        ]);
+
+        PublicKey::from_slice(&agg_key.agg_public_key().to_bytes()).expect("Always 33 bytes")
     }
 
-    pub fn get_refund_agg_key(dlc_offer: &DlcOffer, dlc_accept: &DlcAccept) -> AggKey<Normal> {
+    fn calculate_refund_agg_key(&self) -> PublicKey {
         let schnorr = schnorr_fun::Schnorr::<
             sha2::Sha256,
             schnorr_fun::nonce::Deterministic<sha2::Sha256>,
@@ -103,12 +113,40 @@ impl AcceptedContract {
 
         // TODO: Simply call `PublicKey.into()` once `schnorr_fun` and `bitcoin`
         // are updated to use the same `secp256k1` version.
-        musig.new_agg_key(vec![
-            Point::from_bytes(dlc_offer.party_params.refund_pubkey().serialize())
+        let agg_key = musig.new_agg_key(vec![
+            Point::from_bytes(
+                self.offered_contract
+                    .dlc_offer
+                    .party_params
+                    .refund_pubkey()
+                    .serialize(),
+            )
+            .expect("Invalid pubkey"),
+            Point::from_bytes(self.dlc_accept.party_params.refund_pubkey().serialize())
                 .expect("Invalid pubkey"),
-            Point::from_bytes(dlc_accept.party_params.refund_pubkey().serialize())
-                .expect("Invalid pubkey"),
-        ])
+        ]);
+
+        PublicKey::from_slice(&agg_key.agg_public_key().to_bytes()).expect("Always 33 bytes")
+    }
+
+    fn calculate_ephemeral_pubkey(&self) -> PublicKey {
+        // Note: We perform a single hash here, but we double-hash these same messages
+        // to create the contract pre-image. See `calculate_payment_preimage()` for why.
+        let offer_hash_bytes: [u8; 32] = self
+            .offered_contract
+            .dlc_offer
+            .consensus_hash::<sha256::Hash>()
+            .to_byte_array();
+        let accept_hash_bytes: [u8; 32] = self
+            .dlc_accept
+            .consensus_hash::<sha256::Hash>()
+            .to_byte_array();
+
+        let secret_bytes = Self::xor_32_bytes(&offer_hash_bytes, &accept_hash_bytes);
+
+        let secret_key = SecretKey::from_slice(&secret_bytes).expect("Always 32 bytes");
+
+        secret_key.public_key(secp256k1::SECP256K1)
     }
 
     fn xor_32_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
