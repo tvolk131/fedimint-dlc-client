@@ -202,10 +202,8 @@ impl LightningClientModule {
     pub async fn create_offer(
         &self,
         funding_notes: OOBNotes,
-        funding_window: Duration,
         contract_info: ContractInfo,
         total_collateral: Amount,
-        contract_expiration: u32,
         expiration: u64,
     ) -> anyhow::Result<DlcOffer> {
         let contract_id = ContractId::new_random();
@@ -221,23 +219,7 @@ impl LightningClientModule {
             self.generate_claim_keypair(&contract_id).public_key(),
             self.generate_refund_keypair(&contract_id).public_key(),
             &public_nonces,
-            funding_notes
-                .notes()
-                .iter()
-                .map(|note_tier| {
-                    (
-                        note_tier.0,
-                        note_tier
-                            .1
-                            .into_iter()
-                            .map(|note| Note {
-                                nonce: note.nonce(),
-                                signature: note.signature,
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect(),
+            oob_notes_to_tiered_nonces(funding_notes),
         );
 
         let dlc_offer = DlcOffer::new(
@@ -268,13 +250,26 @@ impl LightningClientModule {
         &self,
         dlc_offer: DlcOffer,
         funding_notes: OOBNotes,
-        party_params: PartyParams, // TODO: Calculate this rather than accepting it as an argument.
     ) -> anyhow::Result<DlcAccept> {
-        let dlc_accept = DlcAccept::new(
-            dlc_offer.contract_id.clone(),
-            party_params,
-            unimplemented!(),
+        let contract_info = dlc_offer.contract_info();
+        let contract_id = dlc_offer.contract_id;
+        let total_collateral = dlc_offer.total_collateral;
+
+        let nonces = self.generate_nonces(&contract_id, &contract_info, &total_collateral);
+
+        let public_nonces = nonces
+            .iter()
+            .map(|nonce| nonce.public())
+            .collect::<Vec<_>>();
+
+        let party_params = PartyParams::new(
+            self.generate_claim_keypair(&contract_id).public_key(),
+            self.generate_refund_keypair(&contract_id).public_key(),
+            &public_nonces,
+            oob_notes_to_tiered_nonces(funding_notes),
         );
+
+        let dlc_accept = DlcAccept::new(contract_id.clone(), party_params, unimplemented!());
 
         let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
 
@@ -385,6 +380,26 @@ impl LightningClientModule {
             })
             .collect()
     }
+}
+
+fn oob_notes_to_tiered_nonces(oob_notes: OOBNotes) -> Vec<(Amount, Vec<Note>)> {
+    oob_notes
+        .notes()
+        .iter()
+        .map(|note_tier| {
+            (
+                note_tier.0,
+                note_tier
+                    .1
+                    .into_iter()
+                    .map(|note| Note {
+                        nonce: note.nonce(),
+                        signature: note.signature,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Error, Debug, Clone, Eq, PartialEq)]
