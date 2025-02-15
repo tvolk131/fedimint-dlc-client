@@ -8,10 +8,10 @@ use fedimint_lnv2_common::contracts::{OutgoingContract, PaymentImage};
 use fedimint_mint_common::Note;
 use rand::{thread_rng, Rng};
 use schnorr_fun::adaptor::EncryptedSignature;
+use schnorr_fun::binonce::Nonce;
 use schnorr_fun::fun::marker::{Public, Zero};
 use schnorr_fun::fun::Point;
 use schnorr_fun::fun::Scalar;
-use schnorr_fun::musig::Nonce;
 use secp256k1::schnorr::Signature;
 
 #[derive(Debug, Clone, Encodable, Decodable, PartialEq, Eq)]
@@ -300,7 +300,7 @@ pub struct PartyParams {
     /// The notes that the offerer party will provide as inputs to fund the contract.
     /// The denomination of each note can be determined by checking the signature of the note
     /// against the federation's public keys for all note denominations until a match is found.
-    pub input_notes: Vec<Note>,
+    pub input_notes: Vec<(Amount, Vec<Note>)>,
 }
 
 impl PartyParams {
@@ -308,7 +308,7 @@ impl PartyParams {
         claim_pubkey: PublicKey,
         refund_pubkey: PublicKey,
         public_nonces: &[Nonce],
-        input_notes: Vec<Note>,
+        input_notes: Vec<(Amount, Vec<Note>)>,
     ) -> Self {
         Self {
             claim_pubkey: claim_pubkey.serialize(),

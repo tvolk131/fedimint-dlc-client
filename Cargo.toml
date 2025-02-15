@@ -57,7 +57,7 @@ itertools = "0.14.0"
 erased-serde = "0.4.5"
 lightning-invoice = "0.32.0"
 nostr-sdk = "0.38.0"
-schnorr_fun = { version = "0.10.0", features = ["serde", "bincode"] }
+schnorr_fun = { version = "0.11.0", features = ["serde", "bincode"] }
 tracing = "0.1.41"
 rand = "0.8.5"
 secp256k1 = "0.29.0"

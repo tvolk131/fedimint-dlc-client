@@ -36,6 +36,7 @@ erased-serde = { workspace = true }
 lightning-invoice = { workspace = true }
 nostr-sdk = { workspace = true }
 rand = { workspace = true }
+rand_chacha = "0.9.0"
 sha2 = { workspace = true }
 secp256k1 = { workspace = true }
 schnorr_fun = { workspace = true }

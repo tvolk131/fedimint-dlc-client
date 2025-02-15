@@ -36,9 +36,12 @@ use fedimint_lnv2_common::config::LightningClientConfig;
 use fedimint_lnv2_common::contracts::IncomingContract;
 use fedimint_lnv2_common::{LightningModuleTypes, MODULE_CONSENSUS_VERSION};
 use fedimint_mint_client::OOBNotes;
+use fedimint_mint_common::Note;
 use messages::{
     ContractId, ContractRole, DlcAccept, DlcOffer, DlcSign, OfferedContract, PartyParams,
 };
+use schnorr_fun::binonce::{NonceKeyPair, SecretNonce};
+use schnorr_fun::fun::Scalar;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -203,10 +206,39 @@ impl LightningClientModule {
         contract_info: ContractInfo,
         total_collateral: Amount,
         contract_expiration: u32,
-        party_params: PartyParams, // TODO: Calculate this rather than accepting it as an argument.
         expiration: u64,
     ) -> anyhow::Result<DlcOffer> {
         let contract_id = ContractId::new_random();
+
+        let nonces = self.generate_nonces(&contract_id, &contract_info, &total_collateral);
+
+        let public_nonces = nonces
+            .iter()
+            .map(|nonce| nonce.public())
+            .collect::<Vec<_>>();
+
+        let party_params = PartyParams::new(
+            self.generate_claim_keypair(&contract_id).public_key(),
+            self.generate_refund_keypair(&contract_id).public_key(),
+            &public_nonces,
+            funding_notes
+                .notes()
+                .iter()
+                .map(|note_tier| {
+                    (
+                        note_tier.0,
+                        note_tier
+                            .1
+                            .into_iter()
+                            .map(|note| Note {
+                                nonce: note.nonce(),
+                                signature: note.signature,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
+        );
 
         let dlc_offer = DlcOffer::new(
             contract_id.clone(),
@@ -292,6 +324,66 @@ impl LightningClientModule {
         dbtx.commit_tx_result().await?;
 
         Ok(())
+    }
+
+    fn generate_claim_keypair(&self, contract_id: &ContractId) -> Keypair {
+        let scalar = secp256k1::Scalar::from_be_bytes(contract_id.0).unwrap();
+        self.keypair
+            .add_xonly_tweak(&secp256k1::SECP256K1, &scalar)
+            .unwrap()
+            .add_xonly_tweak(
+                &secp256k1::SECP256K1,
+                &secp256k1::Scalar::from_be_bytes([0u8; 32]).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn generate_refund_keypair(&self, contract_id: &ContractId) -> Keypair {
+        let scalar = secp256k1::Scalar::from_be_bytes(contract_id.0).unwrap();
+        self.keypair
+            .add_xonly_tweak(&secp256k1::SECP256K1, &scalar)
+            .unwrap()
+            .add_xonly_tweak(
+                &secp256k1::SECP256K1,
+                &secp256k1::Scalar::from_be_bytes([1u8; 32]).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn generate_nonces(
+        &self,
+        contract_id: &ContractId,
+        contract_info: &ContractInfo,
+        total_collateral: &Amount,
+    ) -> Vec<NonceKeyPair> {
+        let secret_key_scalar = Scalar::from_bytes(self.keypair.secret_bytes())
+            .unwrap()
+            .non_zero()
+            .unwrap();
+
+        let nonce_gen = schnorr_fun::nonce::Deterministic::<sha2::Sha256>::default();
+
+        let payouts = contract_info.get_payouts(total_collateral.msats).unwrap();
+
+        payouts
+            .into_iter()
+            .enumerate()
+            .map(|(payout_index, _payout)| {
+                SecretNonce([
+                    schnorr_fun::fun::derive_nonce!(
+                        nonce_gen => nonce_gen,
+                        secret => secret_key_scalar,
+                        public => [contract_id.0, payout_index.to_le_bytes(), [0]]
+                    ),
+                    schnorr_fun::fun::derive_nonce!(
+                        nonce_gen => nonce_gen,
+                        secret => secret_key_scalar,
+                        public => [contract_id.0, payout_index.to_le_bytes(), [1]]
+                    ),
+                ])
+                .into_keypair()
+            })
+            .collect()
     }
 }
 
